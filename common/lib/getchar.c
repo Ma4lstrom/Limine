@@ -5,6 +5,7 @@
 #include <lib/misc.h>
 #include <lib/term.h>
 #include <lib/print.h>
+#include <lib/mouse.h>
 #include <menu.h>
 #if defined (BIOS)
 #  include <lib/real.h>
@@ -197,7 +198,9 @@ int pit_sleep_ms_and_quit_on_keypress(uint64_t milliseconds) {
         return 0;
     }
 
-    if (!serial) {
+    // The fast path blocks in real mode for the whole duration. We can only
+    // take it when nothing needs polling between ticks.
+    if (!serial && !mouse_available) {
         return _pit_sleep_and_quit_on_keypress(ticks);
     }
 
@@ -208,28 +211,37 @@ int pit_sleep_ms_and_quit_on_keypress(uint64_t milliseconds) {
             return ret;
         }
 
-        ret = serial_in();
+        if (serial) {
+            ret = serial_in();
 
-        if (ret != -1) {
+            if (ret != -1) {
 again:
-            switch (ret) {
-                case '\r':
-                    return '\n';
-                case 0x1b:
-                    stall(10);
-                    ret = serial_in();
-                    if (ret == -1) {
-                        return GETCHAR_ESCAPE;
-                    }
-                    if (ret == '[') {
-                        return input_sequence();
-                    }
-                    goto again;
-                case 0x7f:
-                    return '\b';
-            }
+                switch (ret) {
+                    case '\r':
+                        return '\n';
+                    case 0x1b:
+                        stall(10);
+                        ret = serial_in();
+                        if (ret == -1) {
+                            return GETCHAR_ESCAPE;
+                        }
+                        if (ret == '[') {
+                            return input_sequence();
+                        }
+                        goto again;
+                    case 0x7f:
+                        return '\b';
+                }
 
-            return ret;
+                return ret;
+            }
+        }
+
+        if (mouse_available) {
+            int m = mouse_bios_poll();
+            if (m != 0) {
+                return m;
+            }
         }
     }
 
@@ -303,7 +315,7 @@ int pit_sleep_ms_and_quit_on_keypress(uint64_t milliseconds) {
 
     UINTN which;
 
-    EFI_EVENT events[2];
+    EFI_EVENT events[3];
 
     EFI_GUID exproto_guid = EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL_GUID;
     EFI_GUID sproto_guid = EFI_SIMPLE_TEXT_INPUT_PROTOCOL_GUID;
@@ -328,6 +340,14 @@ int pit_sleep_ms_and_quit_on_keypress(uint64_t milliseconds) {
         events[0] = exproto->WaitForKeyEx;
     }
 
+    // Wake on pointer input too, if a mouse is present (events[2]). The timer
+    // occupies events[1] and is (re)created below.
+    EFI_EVENT mouse_ev = mouse_available ? mouse_uefi_wait_event() : NULL;
+    UINTN n_events = mouse_ev != NULL ? 3 : 2;
+    if (mouse_ev != NULL) {
+        events[2] = mouse_ev;
+    }
+
 restart:
     gBS->CreateEvent(EVT_TIMER, TPL_CALLBACK, NULL, NULL, &events[1]);
 
@@ -337,11 +357,20 @@ restart:
 again:
     memset(&kd, 0, sizeof(EFI_KEY_DATA));
 
-    gBS->WaitForEvent(2, events, &which);
+    gBS->WaitForEvent(n_events, events, &which);
 
     if (which == 1) {
         gBS->CloseEvent(events[1]);
         return 0;
+    }
+
+    if (mouse_ev != NULL && which == 2) {
+        int m = mouse_uefi_read();
+        if (m != 0) {
+            gBS->CloseEvent(events[1]);
+            return m;
+        }
+        goto again;
     }
 
     EFI_STATUS status;

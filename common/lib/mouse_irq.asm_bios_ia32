@@ -1,0 +1,43 @@
+section .realmode
+
+bits 16
+
+global int_74_isr
+global mouse_pkt_buf
+global mouse_pkt_head
+global mouse_pkt_tail
+
+; IRQ12 (PS/2 auxiliary device / mouse) handler. It is installed into the
+; real-mode IVT and therefore fires while the loader is thunked down to real
+; mode polling the keyboard. Interrupts are enabled in that window, so this is
+; the only race-free way to capture mouse bytes: the 8042 output buffer is a
+; single byte deep, and polling it from protected mode (where interrupts are
+; off) would drop most of a streaming mouse's packets.
+;
+; The handler simply pulls the queued byte and stores it in a small ring buffer
+; that the C side (mouse_bios_poll) drains and decodes into packets.
+int_74_isr:
+    push ax
+    push bx
+
+    in al, 0x60                      ; read the byte the 8042 queued for us
+
+    xor bh, bh
+    mov bl, [cs:mouse_pkt_head]
+    and bx, 0x3f                     ; ring index (buffer is 64 bytes)
+    mov [cs:mouse_pkt_buf + bx], al
+    inc byte [cs:mouse_pkt_head]
+
+    mov al, 0x20
+    out 0xa0, al                     ; EOI to the slave PIC (IRQ12 is on it)
+    out 0x20, al                     ; EOI to the master PIC (cascade)
+
+    pop bx
+    pop ax
+    iret
+
+mouse_pkt_buf:  times 64 db 0
+mouse_pkt_head: db 0
+mouse_pkt_tail: db 0
+
+section .note.GNU-stack noalloc noexec nowrite progbits

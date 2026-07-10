@@ -15,6 +15,7 @@
 #include <lib/term.h>
 #include <lib/gterm.h>
 #include <lib/getchar.h>
+#include <lib/mouse.h>
 #include <lib/uri.h>
 #include <mm/pmm.h>
 #include <drivers/vbe.h>
@@ -1047,6 +1048,63 @@ static bool find_entry_by_path(const char *path, struct menu_entry *current_entr
     return ret;
 }
 
+// Map from on-screen rows to menu entries, rebuilt every time the tree is
+// drawn so that a mouse click can be resolved to the entry under the pointer.
+struct mouse_hit {
+    size_t row;
+    size_t index;
+    struct menu_entry *entry;
+};
+#define MOUSE_HITS_MAX 256
+static struct mouse_hit mouse_hits[MOUSE_HITS_MAX];
+static size_t mouse_hits_n = 0;
+
+// Walk the visible tree exactly like print_tree counts it, recording the index
+// of `target`. Used to resolve an entry's selection index regardless of scroll.
+static bool entry_index_walk(struct menu_entry *cur, struct menu_entry *target,
+                             size_t *counter, size_t *out) {
+    for (; cur != NULL; cur = cur->next) {
+        if (should_skip_entry(cur))
+            continue;
+        if (cur == target) {
+            *out = *counter;
+            return true;
+        }
+        (*counter)++;
+        if (cur->sub != NULL && cur->expanded) {
+            if (entry_index_walk(cur->sub, target, counter, out))
+                return true;
+        }
+    }
+    return false;
+}
+
+static bool entry_index_of(struct menu_entry *target, size_t *out) {
+    size_t counter = 0;
+    return entry_index_walk(menu_tree, target, &counter, out);
+}
+
+// Stamp the mouse pointer (a reverse-video block) at its current cell without
+// disturbing the text cursor used for the rest of the drawing.
+static void draw_mouse_pointer(void) {
+    if (!mouse_available || serial)
+        return;
+    if (terms_i == 0 || terms[0] == NULL)
+        return;
+    if (mouse_y >= terms[0]->rows || mouse_x >= terms[0]->cols)
+        return;
+
+    size_t sx, sy;
+    terms[0]->get_cursor_pos(terms[0], &sx, &sy);
+    // Disable scrolling so stamping in the bottom-right corner can't scroll the
+    // whole menu up by a line.
+    FOR_TERM(TERM->scroll_enabled = false);
+    set_cursor_pos_helper(mouse_x, mouse_y);
+    print("\e[0m\e[7m \e[27m");
+    FOR_TERM(TERM->scroll_enabled = true);
+    set_cursor_pos_helper(sx, sy);
+}
+
 static size_t print_tree(size_t offset, size_t window, const char *shift, size_t level, size_t base_index, size_t selected_entry,
                       struct menu_entry *current_entry,
                       struct menu_entry **selected_menu_entry,
@@ -1069,6 +1127,9 @@ static size_t print_tree(size_t offset, size_t window, const char *shift, size_t
     if (shift == NULL) {
         no_print = true;
     }
+    if (!level && !no_print) {
+        mouse_hits_n = 0;
+    }
 
     for (;;) {
         size_t cur_len = 0;
@@ -1083,6 +1144,16 @@ static size_t print_tree(size_t offset, size_t window, const char *shift, size_t
         }
         if (!no_print && base_index + max_entries >= offset + window) {
             goto skip_line;
+        }
+        if (!no_print) {
+            size_t cxr, cyr;
+            terms[0]->get_cursor_pos(terms[0], &cxr, &cyr);
+            if (mouse_hits_n < MOUSE_HITS_MAX) {
+                mouse_hits[mouse_hits_n].row = cyr;
+                mouse_hits[mouse_hits_n].index = base_index + max_entries;
+                mouse_hits[mouse_hits_n].entry = current_entry;
+                mouse_hits_n++;
+            }
         }
         if (!no_print) print("%s", shift);
         if (level) {
@@ -1723,6 +1794,8 @@ noreturn void _menu(bool first_run) {
 #endif
     }
 
+    mouse_init();
+
     size_t tree_offset = 0;
     size_t header_offset = (menu_branding[0] != '\0') ? 2 : 0;
     bool has_secondary_help = editor_enabled;
@@ -1906,6 +1979,8 @@ refresh:
         goto editor;
     }
 
+    draw_mouse_pointer();
+
     FOR_TERM(TERM->double_buffer_flush(TERM));
 
     for (;;) {
@@ -1948,6 +2023,37 @@ timeout_aborted:
                 if (++selected_entry == max_entries)
                     selected_entry = 0;
                 goto refresh;
+            case GETCHAR_MOUSE_MOTION:
+                // Redraw so the pointer follows the cursor to its new cell.
+                goto refresh;
+            case GETCHAR_MOUSE_LEFT: {
+                // Activate whatever entry sits on the pointer's row.
+                for (size_t i = 0; i < mouse_hits_n; i++) {
+                    if (mouse_hits[i].row == mouse_y) {
+                        selected_entry = mouse_hits[i].index;
+                        print_tree(0, 0, NULL, 0, 0, selected_entry, menu_tree,
+                                   &selected_menu_entry, NULL, NULL);
+                        goto autoboot;
+                    }
+                }
+                goto refresh;
+            }
+            case GETCHAR_MOUSE_RIGHT: {
+                // Right click goes "back": collapse the selected directory, or
+                // failing that collapse and select its parent.
+                if (selected_menu_entry != NULL) {
+                    if (selected_menu_entry->sub != NULL && selected_menu_entry->expanded) {
+                        selected_menu_entry->expanded = false;
+                    } else if (selected_menu_entry->parent != NULL) {
+                        size_t pidx;
+                        if (entry_index_of(selected_menu_entry->parent, &pidx)) {
+                            selected_menu_entry->parent->expanded = false;
+                            selected_entry = pidx;
+                        }
+                    }
+                }
+                goto refresh;
+            }
             case GETCHAR_CURSOR_RIGHT:
             case '\n':
             case ' ':
@@ -2040,6 +2146,9 @@ timeout_aborted:
 }
 
 noreturn void boot(char *config) {
+    // Disarm the pointer device before handing control to a kernel.
+    mouse_deinit();
+
 #if defined (__riscv)
     init_riscv(config);
 #endif
